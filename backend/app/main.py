@@ -465,32 +465,21 @@ def predict(customer: Customer):
 
 @app.post("/predict-csv")
 async def predict_csv(file: UploadFile = File(...)):
-    """Predict churn risk for customers in an uploaded CSV file.
+    """Predict churn risk for customers in an uploaded CSV file."""
 
-    The uploaded file is processed in memory and is not saved permanently.
-    """
     if not file.filename or not file.filename.lower().endswith(".csv"):
-        raise HTTPException(
-            status_code=400,
-            detail="Please upload a CSV file.",
-        )
+        raise HTTPException(status_code=400, detail="Please upload a CSV file.")
+
+    max_csv_bytes = 5 * 1024 * 1024
 
     try:
-        # Limit uploads to 5 MB and read the file before using df.
-        max_csv_bytes = 5 * 1024 * 1024
         contents = await file.read(max_csv_bytes + 1)
 
         if not contents:
-            raise HTTPException(
-                status_code=400,
-                detail="The uploaded CSV file is empty.",
-            )
+            raise HTTPException(status_code=400, detail="The uploaded CSV file is empty.")
 
         if len(contents) > max_csv_bytes:
-            raise HTTPException(
-                status_code=413,
-                detail="CSV file exceeds the 5 MB upload limit.",
-            )
+            raise HTTPException(status_code=413, detail="CSV file exceeds the 5 MB upload limit.")
 
         try:
             df = pd.read_csv(io.BytesIO(contents))
@@ -502,25 +491,38 @@ async def predict_csv(file: UploadFile = File(...)):
         finally:
             await file.close()
 
-        required = {"tenure", "monthly_charges", "contract"}
+        required = {"tenure", "monthly_charges"}
         missing = required - set(df.columns)
+
+        contract_columns = {
+            "contract_monthly",
+            "contract_one_year",
+            "contract_two_year",
+        }
+
+        has_text_contract = "contract" in df.columns
+        has_one_hot_contract = contract_columns.issubset(df.columns)
+
         if missing:
             raise HTTPException(
                 status_code=422,
                 detail=f"Missing CSV columns: {sorted(missing)}",
             )
 
-        if df.empty:
+        if not has_text_contract and not has_one_hot_contract:
             raise HTTPException(
-                status_code=400,
-                detail="The uploaded CSV contains no customers.",
+                status_code=422,
+                detail=(
+                    "CSV must contain either a 'contract' column or all three "
+                    "columns: contract_monthly, contract_one_year, contract_two_year."
+                ),
             )
 
+        if df.empty:
+            raise HTTPException(status_code=400, detail="The uploaded CSV contains no customers.")
+
         if len(df) > 10000:
-            raise HTTPException(
-                status_code=413,
-                detail="Upload a maximum of 10,000 customers at a time.",
-            )
+            raise HTTPException(status_code=413, detail="Upload a maximum of 10,000 customers at a time.")
 
         results = []
 
@@ -531,47 +533,77 @@ async def predict_csv(file: UploadFile = File(...)):
                 return bool(value)
             if value in (1, 0):
                 return bool(value)
+
             normalized = str(value).strip().lower()
+
             if normalized in ("true", "yes", "1"):
                 return True
             if normalized in ("false", "no", "0"):
                 return False
+
             raise ValueError(
                 f"Invalid boolean value '{value}'. Use true/false, yes/no, or 1/0."
             )
 
+        def contract_from_row(row):
+            if has_text_contract:
+                return str(row["contract"])
+
+            values = [
+                as_bool(row["contract_monthly"]),
+                as_bool(row["contract_one_year"]),
+                as_bool(row["contract_two_year"]),
+            ]
+
+            if sum(values) != 1:
+                raise ValueError(
+                    "Exactly one contract column must be 1: "
+                    "contract_monthly, contract_one_year, contract_two_year."
+                )
+
+            if values[0]:
+                return "Monthly"
+            if values[1]:
+                return "One year"
+            return "Two year"
+
         for index, row in df.iterrows():
-            customer = Customer(
-                tenure=int(row["tenure"]),
-                monthly_charges=float(row["monthly_charges"]),
-                contract=str(row["contract"]),
-                internet_fiber=as_bool(row.get("internet_fiber", False)),
-                tech_support=as_bool(row.get("tech_support", False)),
-                paperless_billing=as_bool(
-                    row.get("paperless_billing", True), default=True
-                ),
-                senior_citizen=as_bool(row.get("senior_citizen", False)),
-                dependents=as_bool(row.get("dependents", False)),
-            )
+            try:
+                customer = Customer(
+                    tenure=int(row["tenure"]),
+                    monthly_charges=float(row["monthly_charges"]),
+                    contract=contract_from_row(row),
+                    internet_fiber=as_bool(row.get("internet_fiber", False)),
+                    tech_support=as_bool(row.get("tech_support", False)),
+                    paperless_billing=as_bool(
+                        row.get("paperless_billing", True), default=True
+                    ),
+                    senior_citizen=as_bool(row.get("senior_citizen", False)),
+                    dependents=as_bool(row.get("dependents", False)),
+                )
 
-            features = customer_features(customer)
-            probability = float(model.predict_proba(features)[0, 1])
-            risk_percent = round(probability * 100, 2)
+                features = customer_features(customer)
+                probability = float(model.predict_proba(features)[0, 1])
+                risk_percent = round(probability * 100, 2)
 
-            if risk_percent >= 70:
-                segment = "High"
-            elif risk_percent >= 40:
-                segment = "Medium"
-            else:
-                segment = "Low"
+                if risk_percent >= 70:
+                    segment = "High"
+                elif risk_percent >= 40:
+                    segment = "Medium"
+                else:
+                    segment = "Low"
 
-            results.append({
-                "customer_index": int(index),
-                "churn_risk_percent": risk_percent,
-                "risk_segment": segment,
-            })
+                results.append({
+                    "customer_index": int(index),
+                    "churn_risk_percent": risk_percent,
+                    "risk_segment": segment,
+                })
+
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ValueError(f"CSV row {index + 2}: {exc}") from exc
 
         result_df = pd.DataFrame(results)
+
         return {
             "total_customers": len(results),
             "high_risk": int((result_df["risk_segment"] == "High").sum()),
