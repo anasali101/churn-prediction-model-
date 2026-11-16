@@ -7,4 +7,5 @@ xgboost
 shap
 lime
 sqlalchemy
-python-multipartnumpy
+python-multipart
+numpy
